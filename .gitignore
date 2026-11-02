@@ -1,2 +1,9 @@
 ﻿__pycache__/
 .pytest_cache/
+
+
+qcmr oxma kuhc wzrz
+
+
+# [Environment]::SetEnvironmentVariable('GMAIL_ADDRESS', 'thesagarjain8@gmail.com', 'User')
+# [Environment]::SetEnvironmentVariable('GMAIL_APP_PASSWORD', 'qcmr oxma kuhc wzrz', 'User')

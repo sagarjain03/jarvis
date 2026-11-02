@@ -8,6 +8,7 @@ from pc_control import (
     PcControlTool,
     Plan,
     PlanError,
+    PowerGate,
     first_youtube_video,
     format_weather,
     plan,
@@ -136,6 +137,120 @@ def test_format_weather_summarizes_wttr_json():
     assert format_weather(data) == (
         "Weather in Delhi: Sunny, 30°C (feels like 33°C), humidity 40%."
     )
+    # wttr.in's "nearest area" can be a nearby town; say the city the user asked for
+    assert format_weather(data, "Mumbai").startswith("Weather in Mumbai:")
+
+
+# --- folders, typing, brightness, close -------------------------------------
+
+@pytest.mark.parametrize(
+    "name, shell",
+    [("downloads", "shell:Downloads"), ("Documents", "shell:Personal"),
+     ("desktop", "shell:Desktop"), ("pictures", "shell:My Pictures"),
+     ("music", "shell:My Music"), ("videos", "shell:My Video")],
+)
+def test_open_folder_allowlist(name, shell):
+    assert plan("open_folder", name) == Plan("open_app", shell)
+
+
+@pytest.mark.parametrize("name", ["C:\\Windows", "system32", "..", ""])
+def test_open_folder_rejects_others(name):
+    with pytest.raises(PlanError):
+        plan("open_folder", name)
+
+
+def test_type_text():
+    assert plan("type_text", "hello world") == Plan("type", "hello world")
+
+
+@pytest.mark.parametrize("text", ["", "x" * 501])
+def test_type_text_rejects_empty_or_long(text):
+    with pytest.raises(PlanError):
+        plan("type_text", text)
+
+
+@pytest.mark.parametrize(
+    "action, target, payload",
+    [("set_brightness", "70", "70"), ("set_brightness", "150", "100"),
+     ("set_brightness", "-5", "0"), ("set_brightness", "40%", "40"),
+     ("brightness_up", "", "+10"), ("brightness_down", "", "-10")],
+)
+def test_brightness(action, target, payload):
+    assert plan(action, target) == Plan("brightness", payload)
+
+
+def test_set_brightness_needs_number():
+    with pytest.raises(PlanError):
+        plan("set_brightness", "bright")
+
+
+def test_close_window():
+    assert plan("close_window", "") == Plan("keys", "close_window")
+
+
+# --- power: request, then confirm in a later turn ---------------------------
+
+@pytest.mark.parametrize("action", ["shutdown", "restart", "sleep"])
+def test_power_actions_only_request(action):
+    assert plan(action, "") == Plan("power_request", action)
+
+
+def test_confirm_power_plan():
+    assert plan("confirm_power", "") == Plan("power_confirm", "")
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_gate_confirms_in_next_turn_within_30s():
+    clock = _Clock()
+    gate = PowerGate(now=clock)
+    gate.new_turn()
+    gate.request("shutdown")
+    gate.new_turn()
+    clock.t = 10
+    assert gate.confirm() == "shutdown"
+    assert gate.confirm() is None  # used up
+
+
+def test_gate_refuses_confirm_in_same_turn():
+    gate = PowerGate(now=_Clock())
+    gate.new_turn()
+    gate.request("shutdown")
+    assert gate.confirm() is None
+
+
+def test_gate_expires_after_30s():
+    clock = _Clock()
+    gate = PowerGate(now=clock)
+    gate.new_turn()
+    gate.request("restart")
+    gate.new_turn()
+    clock.t = 31
+    assert gate.confirm() is None
+
+
+def test_gate_confirm_without_request():
+    gate = PowerGate(now=_Clock())
+    gate.new_turn()
+    assert gate.confirm() is None
+
+
+def test_power_request_never_runs_power(monkeypatch):
+    calls = []
+    monkeypatch.setattr("pc_control._power", lambda kind: calls.append(kind))
+    monkeypatch.setattr("pc_control.POWER_GATE", PowerGate(now=_Clock()))
+    tool = PcControlTool()
+    r = tool.execute(action="shutdown")
+    assert r.success and "sure" in r.content.lower()
+    r = tool.execute(action="confirm_power")  # same turn
+    assert r.success is False
+    assert calls == []
 
 
 # --- apps -------------------------------------------------------------------
@@ -175,7 +290,7 @@ def test_lock_screen_and_info_actions():
 
 def test_unknown_action_is_rejected():
     with pytest.raises(PlanError):
-        plan("shutdown", "")
+        plan("format_disk", "")
 
 
 # --- tool wrapper -----------------------------------------------------------
