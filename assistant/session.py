@@ -6,8 +6,9 @@ All pure so it can be tested without a microphone.
 from __future__ import annotations
 
 import re
+import threading
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -46,6 +47,29 @@ class Session:
         return self._now() - self._last > self._idle
 
 
+SILENCE_CHUNKS = 12  # ~0.8 s of quiet (1024-sample chunks at 16 kHz) ends your turn
+DEFAULT_THRESHOLD = 500
+MAX_THRESHOLD = 3000  # never so high that normal speech can't get through
+
+
+def calibrate_threshold(levels: list[float]) -> float:
+    """Speech threshold from ~1 s of room noise: 3x the typical (median) level.
+
+    The median ignores a one-off spike like a door slam during calibration.
+    """
+    if not levels:
+        return DEFAULT_THRESHOLD
+    return min(MAX_THRESHOLD, max(DEFAULT_THRESHOLD, float(np.median(levels)) * 3))
+
+
+def play_all(items: Iterable, play: Callable[[object], bool], interrupted: threading.Event) -> bool:
+    """Play items in order; ``play`` returns False if cut off. True if all played."""
+    for item in items:
+        if interrupted.is_set() or not play(item):
+            return False
+    return True
+
+
 class SpeechGate:
     """Feed one RMS level per audio chunk; reports when an utterance is complete.
 
@@ -55,8 +79,8 @@ class SpeechGate:
 
     def __init__(
         self,
-        threshold: float = 500,
-        silence_chunks: int = 23,  # ~1.5 s at 1024-sample chunks, 16 kHz
+        threshold: float = DEFAULT_THRESHOLD,
+        silence_chunks: int = SILENCE_CHUNKS,
         start_timeout_chunks: int = 125,  # ~8 s
         max_chunks: int = 470,  # ~30 s
         min_speech_chunks: int = 2,  # ignore single clicks

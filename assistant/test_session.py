@@ -1,9 +1,78 @@
 """Tests for the conversation-session logic (pure; no audio devices)."""
 
+import threading
+
 import numpy as np
 import pytest
 
-from session import Session, SpeechGate, envelope, is_stop_command, split_sentences
+from session import (
+    SILENCE_CHUNKS,
+    Session,
+    SpeechGate,
+    calibrate_threshold,
+    envelope,
+    is_stop_command,
+    play_all,
+    split_sentences,
+)
+
+
+# --- barge-in playback ---------------------------------------------------------
+
+def test_play_all_plays_everything_when_not_interrupted():
+    played = []
+    done = play_all(iter(["a", "b", "c"]), lambda x: played.append(x) or True, threading.Event())
+    assert done and played == ["a", "b", "c"]
+
+
+def test_play_all_skips_rest_after_interrupt():
+    stop = threading.Event()
+    played = []
+
+    def play(x):
+        played.append(x)
+        stop.set()  # user said "Jarvis" during the first sentence
+        return False
+
+    assert not play_all(iter(["a", "b", "c"]), play, stop)
+    assert played == ["a"]
+
+
+def test_play_all_plays_nothing_if_already_interrupted():
+    stop = threading.Event()
+    stop.set()
+    played = []
+    assert not play_all(iter(["a"]), lambda x: played.append(x) or True, stop)
+    assert played == []
+
+
+# --- noise calibration ---------------------------------------------------------
+
+def test_quiet_room_keeps_default_threshold():
+    assert calibrate_threshold([40, 60, 50, 55]) == 500
+
+
+def test_noisy_room_raises_threshold():
+    assert calibrate_threshold([300, 320, 310, 290]) == pytest.approx(305 * 3)  # median 305
+
+
+def test_calibration_ignores_a_short_spike():
+    # a door slam in the sample should not make Jarvis deaf
+    assert calibrate_threshold([300, 300, 300, 9000, 300]) == pytest.approx(900)
+
+
+def test_calibration_is_capped_and_handles_no_data():
+    assert calibrate_threshold([5000] * 10) == 3000
+    assert calibrate_threshold([]) == 500
+
+
+def test_default_silence_is_under_a_second():
+    # 1024-sample chunks at 16 kHz = 64 ms each
+    assert SILENCE_CHUNKS * 1024 / 16000 < 1.0
+    gate = SpeechGate()
+    _feed(gate, [900, 900])
+    states = [gate.feed(10) for _ in range(SILENCE_CHUNKS)]
+    assert states[-1] == "done" and "done" not in states[:-1]
 
 
 # --- sentence streaming ------------------------------------------------------
