@@ -199,3 +199,24 @@ def test_envelope_length_and_range():
 
 def test_envelope_of_silence_is_zero():
     assert envelope(np.zeros(24000), 24000, fps=30) == [0.0] * 30
+
+
+# --- tray pause / quit ------------------------------------------------------------
+
+def test_listen_control_pause_resume_quit():
+    from session import ListenControl
+
+    changes = []
+    c = ListenControl(on_change=changes.append)
+    assert not c.paused and not c.quitting
+    c.handle("pause")
+    c.handle("pause")  # no duplicate notification
+    assert c.paused and changes == [True]
+    c.handle("resume")
+    assert not c.paused and changes == [True, False]
+    c.handle("toggle")
+    assert c.paused
+    c.handle("something else")
+    c.handle("quit")
+    assert c.quitting
+    assert c.should_stop()

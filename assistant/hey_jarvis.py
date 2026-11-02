@@ -3,7 +3,7 @@
 Say "Jarvis" (or "Hey Jarvis"): Jarvis answers "Yes Master" and the orb
 appears. Keep talking — no wake word needed — until you say "Stop Jarvis"
 or stay quiet for IDLE_SECONDS. Say "Jarvis" while it talks to cut it off.
-Ctrl+C to quit.
+Pause, resume, or quit from the tray icon (or Ctrl+C in the console).
 """
 
 from __future__ import annotations
@@ -13,7 +13,10 @@ import logging
 import os
 import queue
 import threading
+import time
 import warnings
+from datetime import datetime, timedelta
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
@@ -28,13 +31,19 @@ from openjarvis.cli._voice_chat import VoiceSession  # noqa: E402
 from openjarvis.core.config import load_config  # noqa: E402
 from openjarvis.speech.voice_io import _frames_to_wav, _rms  # noqa: E402
 
-from brain import FACTS_PATH, Brain, build_agent, is_hindi  # noqa: E402
+from alerts import BatteryWatch, DailyAt, MeetingWatch, evening_summary, start_alert_thread  # noqa: E402
+from brain import FACTS_PATH, Brain, build_agent, build_local_agent, is_hindi  # noqa: E402
+from calendar_tool import CalendarFeed, CalendarTool  # noqa: E402
+from clipboard_tool import ClipboardTool  # noqa: E402
 from ducking import Ducker  # noqa: E402
 from email_reader import EmailReaderTool  # noqa: E402
+from file_finder import FileFinderTool  # noqa: E402
 from orb_client import OrbClient  # noqa: E402
 from pc_control import POWER_GATE, PcControlTool  # noqa: E402
 from reminders import ReminderStore, ReminderTool, start_reminder_thread  # noqa: E402
+from routines import DEFAULT_ROUTINES, RoutineError, RoutineTool, load_routines, validate  # noqa: E402
 from session import (  # noqa: E402
+    ListenControl,
     Session,
     SpeechGate,
     calibrate_threshold,
@@ -46,7 +55,9 @@ from session import (  # noqa: E402
 from sounds import chime  # noqa: E402
 from stt import Transcriber  # noqa: E402
 from telegram_bot import start_telegram  # noqa: E402
+from todo_list import TodoStore, TodoTool  # noqa: E402
 from tts import Speaker, edge_synth  # noqa: E402
+from vision import ScreenTool  # noqa: E402
 from wrapped_tools import CompactWebSearch, LockedMemoryTool  # noqa: E402
 
 # "Hey Jarvis" scores ~1.0 and plain "Jarvis" 0.3-1.0 on openWakeWord's
@@ -68,9 +79,26 @@ CLOUD_TTS = True
 DUCK_OTHER_APPS = True  # turn music/videos down while you talk to Jarvis
 HINDI_VOICE = "hm_omega"  # Kokoro Hindi male; "h" prefix selects the Hindi pipeline
 ORB_FPS = 30
+BATTERY_LOW = 20  # % — warn once when unplugged below this
+MEETING_LEAD_MINUTES = 10  # announce calendar events this long before
+EVENING_SUMMARY_AT = "21:00"  # to-dos + tomorrow's calendar; None to turn off
+LOG_PATH = Path.home() / ".openjarvis" / "jarvis.log"  # used when started hidden
 
-console = Console()
+
+def _make_console() -> Console:
+    # start-jarvis-hidden.vbs runs without a console window: write to a log
+    # file instead (the tray menu's "Open log" shows it). Fresh each start.
+    if not os.environ.get("JARVIS_HIDDEN"):
+        return Console()
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    os.environ["JARVIS_LOG"] = str(LOG_PATH)  # tells the tray where the log is
+    return Console(file=open(LOG_PATH, "w", encoding="utf-8", buffering=1), width=120)
+
+
+console = _make_console()
 orb = OrbClient()
+control = ListenControl(on_change=orb.tray)  # tray menu: pause / resume / quit
+orb.on_event = control.handle
 _speech_lock = threading.Lock()  # one voice at a time (replies vs. reminders)
 _in_session = threading.Event()
 CHIME = chime()
@@ -186,14 +214,16 @@ def load_wake_detector() -> Model:
         return Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
 
 
-def wait_for_wake_word(detector: Model) -> None:
+def wait_for_wake_word(detector: Model) -> bool:
+    """True when "Jarvis" is heard; False if paused or quit from the tray."""
     detector.reset()
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=WAKE_CHUNK) as mic:
-        while True:
+        while not control.should_stop():
             frames, _ = mic.read(WAKE_CHUNK)
             scores = detector.predict(np.squeeze(frames))
             if max(scores.values()) >= WAKE_THRESHOLD:
-                return
+                return True
+    return False
 
 
 def measure_threshold(seconds: float = 1.0) -> float:
@@ -210,11 +240,14 @@ def measure_threshold(seconds: float = 1.0) -> float:
 
 
 def listen(threshold: float) -> bytes | None:
-    """Record one utterance (WAV bytes), or None if nothing was said for ~8 s."""
+    """Record one utterance (WAV bytes), or None if nothing was said for ~8 s
+    (or listening was paused from the tray)."""
     gate = SpeechGate(threshold=threshold)
     frames: list[bytes] = []
     with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16", blocksize=LISTEN_CHUNK) as mic:
         while True:
+            if control.should_stop():
+                return None
             raw, _ = mic.read(LISTEN_CHUNK)
             data = bytes(raw)
             frames.append(data)
@@ -241,7 +274,7 @@ def converse(
     say("Yes Master.", speaker)
     session = Session(idle_seconds=IDLE_SECONDS)
     try:
-        while True:
+        while not control.should_stop():
             orb.state("listening")
             orb.caption("")
             console.print("[dim cyan]Listening…[/dim cyan]")
@@ -279,15 +312,31 @@ def converse(
 def main() -> None:
     config = load_config()
     store = ReminderStore()
+    todos = TodoStore()
+    try:
+        routines = load_routines()
+    except (RoutineError, ValueError) as exc:  # a typo in the user's routines file
+        console.print(f"[yellow]Routines file has a problem ({exc}); using the defaults.[/yellow]")
+        routines = validate(DEFAULT_ROUTINES)
     tools = [
         PcControlTool(),
         CompactWebSearch(),
         ReminderTool(store),
         EmailReaderTool(),
         LockedMemoryTool(memory_path=FACTS_PATH),
+        ScreenTool(),
+        ClipboardTool(),
+        FileFinderTool(),
+        RoutineTool(routines),
+        CalendarTool(),
+        TodoTool(todos),
     ]
     agent, engine_key, model = build_agent(config, tools)
-    brain = Brain(agent, on_turn=POWER_GATE.new_turn)
+    brain = Brain(
+        agent,
+        on_turn=POWER_GATE.new_turn,
+        fallback=lambda: build_local_agent(config, tools),  # Ollama when offline
+    )
     voice = VoiceSession(config)
     speaker = Speaker(cloud=edge_synth, local=lambda text: _kokoro(text, voice), use_cloud=CLOUD_TTS)
     detector = load_wake_detector()
@@ -320,27 +369,57 @@ def main() -> None:
     else:
         console.print("[green]Telegram: on[/green]")
 
-    def on_reminder(r) -> None:
-        console.print(f"\n[bold yellow]⏰ Reminder:[/bold yellow] {r.message}")
+    def notify(icon: str, spoken: str, text: str) -> None:
+        """Say something unprompted: console, phone (Telegram), voice + orb."""
+        console.print(f"\n[bold yellow]{icon}[/bold yellow] {text}")
         if telegram is not None:
             for chat in telegram[1]:
-                telegram[0].send(chat, f"⏰ Reminder: {r.message}")
-        say(f"Reminder, Master: {r.message}", speaker, caption=f"⏰ {r.message}")
+                telegram[0].send(chat, f"{icon} {text}")
+        say(spoken, speaker, caption=f"{icon} {text}")
         if not _in_session.is_set():
             orb.hide()
 
-    start_reminder_thread(store, on_reminder)
+    start_reminder_thread(store, lambda r: notify("⏰", f"Reminder, Master: {r.message}", r.message))
 
+    battery, meetings, calendar = BatteryWatch(BATTERY_LOW), MeetingWatch(MEETING_LEAD_MINUTES), CalendarFeed()
+    evening = DailyAt(EVENING_SUMMARY_AT) if EVENING_SUMMARY_AT else None
+
+    def check_alerts() -> list[str]:
+        import psutil
+
+        messages = []
+        b = psutil.sensors_battery()
+        if b is not None and (msg := battery.check(b.percent, b.power_plugged)):
+            messages.append(msg)
+        now = datetime.now().astimezone()
+        messages += meetings.check(calendar.events(now, now + timedelta(minutes=MEETING_LEAD_MINUTES + 1)), now)
+        if evening is not None and evening.due(now):
+            midnight = datetime.combine(now.date(), datetime.min.time(), tzinfo=now.tzinfo)
+            tomorrow = calendar.events(midnight + timedelta(days=1), midnight + timedelta(days=2))
+            messages.append(evening_summary([i.text for i in todos.open_items()], tomorrow))
+        return messages
+
+    start_alert_thread(check_alerts, lambda message: notify("🔔", message, message))
+
+    orb.tray(paused=False)  # tray icon: pause / resume / quit
     console.print(f"[green bold]Jarvis is ready[/green bold]  ({engine_key}: {model})")
     say("Jarvis online.", speaker)
     orb.hide()
 
     try:
-        while True:
-            console.print("\n[dim]Say \"Jarvis\"…  (Ctrl+C to quit)[/dim]")
-            wait_for_wake_word(detector)
-            converse(brain, speaker, stt, detector, threshold, ducker)
+        while not control.quitting:
+            if control.paused:
+                console.print("[dim]Paused — microphone off. Resume from the tray icon.[/dim]")
+                while control.paused and not control.quitting:
+                    time.sleep(0.3)
+                continue
+            console.print("\n[dim]Say \"Jarvis\"…  (tray icon or Ctrl+C to quit)[/dim]")
+            if wait_for_wake_word(detector):
+                converse(brain, speaker, stt, detector, threshold, ducker)
+        console.print("[dim]Quitting from the tray.[/dim]")
     finally:
+        if ducker is not None:
+            ducker.restore()
         orb.close()
 
 
@@ -349,3 +428,6 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+    except Exception:
+        console.print_exception()  # in hidden mode this lands in the log
+        raise

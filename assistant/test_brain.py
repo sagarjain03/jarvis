@@ -89,44 +89,32 @@ def test_reset_phrases_clear_memory_without_calling_agent(setup, phrase):
     assert agent.seen[1][1] == []
 
 
-def test_rate_limit_waits_as_told_and_retries_once():
-    agent, sleeps = FakeAgent(), []
-    calls = {"n": 0}
-    ok_run = agent.run
+def test_rate_limit_never_reruns_the_whole_request():
+    # A rerun repeats tools that already ran (night mode ran twice, text typed
+    # twice). Per-call retries live in engine_guard instead.
+    calls = []
 
-    def flaky(text, context=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("RateLimitError: Rate limit reached. Please try again in 4.7475s.")
-        return ok_run(text, context)
+    class Limited:
+        def run(self, text, context=None):
+            calls.append(text)
+            raise RuntimeError("RateLimitError: Rate limit reached. Please try again in 4.7s.")
 
-    agent.run = flaky
-    brain = Brain(agent, sleep=sleeps.append)
-    assert brain.reply("hi") == "answer to hi"
-    assert sleeps == [pytest.approx(5.7475)]  # told wait + 1 s margin
+    assert "busy" in Brain(Limited()).reply("turn on night mode").lower()
+    assert calls == ["turn on night mode"]
 
 
-def test_rate_limit_wait_is_capped_and_retried_twice():
-    agent, sleeps = FakeAgent(), []
+@pytest.mark.parametrize(
+    "msg, wait",
+    [("RateLimitError: Please try again in 4.7475s.", 5.7475),
+     ("RateLimitError: try again in 2m30s", 20),
+     ("rate limit reached", 5.0),
+     ("network down", None)],
+)
+def test_rate_limit_wait(msg, wait):
+    from brain import _rate_limit_wait
 
-    def always_limited(text, context=None):
-        raise RuntimeError("RateLimitError: try again in 2m30s")
-
-    agent.run = always_limited
-    brain = Brain(agent, sleep=sleeps.append)
-    assert "busy" in brain.reply("hi").lower()
-    assert sleeps == [20, 20]
-
-
-def test_other_errors_are_not_retried():
-    agent, sleeps = FakeAgent(), []
-
-    def boom(text, context=None):
-        raise RuntimeError("network down")
-
-    agent.run = boom
-    Brain(agent, sleep=sleeps.append).reply("hi")
-    assert sleeps == []
+    got = _rate_limit_wait(RuntimeError(msg))
+    assert got == (None if wait is None else pytest.approx(wait))
 
 
 @pytest.mark.parametrize(
@@ -191,3 +179,46 @@ def test_failed_turn_is_not_remembered(setup):
     agent.run = ok_run
     brain.reply("hello")
     assert agent.seen[0][1] == []
+
+
+# --- offline fallback ----------------------------------------------------------
+
+class RaisingAgent:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def run(self, text, context=None):
+        raise self.exc
+
+
+def test_offline_falls_back_to_local_model():
+    cloud = RaisingAgent(Exception("litellm.APIConnectionError: getaddrinfo failed"))
+    local = FakeAgent()
+    made = []
+    brain = Brain(cloud, fallback=lambda: made.append(1) or local)
+    assert brain.reply("what is 2+2") == "answer to what is 2+2"
+    assert brain.last_error is None
+    brain.reply("and 3+3?")
+    assert made == [1]  # local agent built once, reused
+    assert local.seen[1][1][0] == (Role.USER, "what is 2+2")  # keeps memory
+
+
+def test_rate_limit_does_not_use_local_model():
+    cloud = RaisingAgent(Exception("RateLimitError: try again in 1s"))
+    used = []
+    brain = Brain(cloud, fallback=lambda: used.append(1) or FakeAgent())
+    assert "busy" in brain.reply("hi")
+    assert used == []
+
+
+def test_offline_without_local_model_says_so():
+    cloud = RaisingAgent(Exception("httpx.ConnectError: connection refused"))
+    brain = Brain(cloud, fallback=lambda: None)
+    assert "offline" in brain.reply("hi").lower()
+
+
+def test_local_model_failing_too_is_handled():
+    cloud = RaisingAgent(Exception("APIConnectionError"))
+    local = RaisingAgent(Exception("ollama crashed"))
+    brain = Brain(cloud, fallback=lambda: local)
+    assert brain.reply("hi") == "Sorry, something went wrong."

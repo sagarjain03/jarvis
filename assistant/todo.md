@@ -37,44 +37,44 @@ Koi secret file mein nahi — sirf env vars.
 
 ## Phase 2 — Smart abilities
 
-- [ ] **7. Screen dekhna (vision)**
+- [x] **7. Screen dekhna (vision)**
   - Tool `look_at_screen(question)`: screenshot → Groq vision model → answer.
   - Privacy: screenshot Groq ko jaata hai; sirf jab user khud poochhe.
   - Test: request payload build (fake post), image resize/compress.
 
-- [ ] **8. Clipboard tool**
+- [x] **8. Clipboard tool**
   - Tool `clipboard(action=read)` → model summarize/translate/reply kare; optional `write`.
   - Test: read/write via fake clipboard, length cap.
 
-- [ ] **9. File finder**
+- [x] **9. File finder**
   - Tool `find_file(query)` sirf allowlisted folders (Desktop, Documents, Downloads) mein; best match open.
   - Test: fuzzy match ranking, allowlist ke bahar kuch nahi, max results.
 
-- [ ] **10. Routines**
+- [x] **10. Routines**
   - `~/.openjarvis/jarvis_routines.json` (work mode, night mode…) → existing `pc_control` actions ki list.
   - Sirf allowlisted actions; power actions routine mein allowed nahi.
   - Test: routine parsing, unknown action reject.
 
-- [ ] **11. Google Calendar**
+- [x] **11. Google Calendar**
   - Tool `calendar(today|tomorrow|next)` read-only (Google Calendar API / ICS secret URL via env var).
   - Morning briefing prompt mein add.
   - Test: event formatting, timezone (UTC → local display).
 
-- [ ] **12. Offline fallback (Ollama)**
+- [x] **12. Offline fallback (Ollama)**
   - Groq network error / down → local Ollama model se jawab (`brain.py`).
   - Test: fallback trigger on connection error, not on rate limit.
 
 ## Phase 3 — Daily life
 
-- [ ] **13. Notes / to-do list**
+- [x] **13. Notes / to-do list**
   - Tool `todo(add|list|done|clear)` → `~/.openjarvis/jarvis_todo.json`; Telegram se bhi chale.
   - Test: store add/list/done, locking, Hindi text.
 
-- [ ] **14. Proactive alerts**
+- [x] **14. Proactive alerts**
   - Background thread: battery < 20% (once), meeting 10 min pehle (item 11 ke baad), evening summary (optional time).
   - Test: battery alert sirf ek baar fire, re-arm on charge.
 
-- [ ] **15. System tray icon**
+- [x] **15. System tray icon**
   - PySide6 `QSystemTrayIcon` (already installed): Pause listening / Resume / Quit; console window hide (`pythonw` launcher).
   - Test: pause flag logic; manual check of tray.
 

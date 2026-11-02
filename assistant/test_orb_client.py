@@ -70,3 +70,22 @@ def test_close_terminates_process():
     orb.state("listening")
     orb.close()
     assert proc.terminated
+
+
+def test_tray_menu_events_reach_jarvis():
+    import threading
+
+    proc = FakeProc()
+    proc.stdout = io.StringIO('{"event": "pause"}\nnot json\n{"event": "quit"}\n')
+    got, done = [], threading.Event()
+
+    def on_event(event):
+        got.append(event)
+        if event == "quit":
+            done.set()
+
+    orb = OrbClient(spawn=lambda: proc, on_event=on_event)
+    orb.tray(paused=True)
+    assert done.wait(2)
+    assert got == ["pause", "quit"]
+    assert json.loads(proc.stdin.getvalue()) == {"cmd": "tray", "paused": True}

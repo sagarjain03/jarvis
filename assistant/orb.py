@@ -5,8 +5,10 @@ Controlled through stdin by orb_client.py, one JSON message per line:
   {"cmd": "level", "value": 0..1}        live microphone loudness
   {"cmd": "speak", "env": [...], "fps": 30}  loudness envelope of the reply
   {"cmd": "caption", "text": "..."}
+  {"cmd": "tray", "paused": bool}       show/update the tray icon
   {"cmd": "hide"} / {"cmd": "quit"}
 The window closes by itself if stdin closes (Jarvis exited).
+Tray menu clicks are written to stdout: {"event": "pause"|"resume"|"quit"}.
 
 Preview frames without a window:  python orb.py --preview OUT_DIR
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import sys
 import threading
@@ -22,10 +25,10 @@ import time
 
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QBrush, QColor, QConicalGradient, QFont, QFontMetrics, QGuiApplication, QImage, QPainter,
-    QPainterPath, QPen, QRadialGradient,
+    QBrush, QColor, QConicalGradient, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient,
 )
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
 
 W, H = 440, 460
 CENTER = QPointF(W / 2, 200)
@@ -247,10 +250,61 @@ class _Bridge(QObject):
     message = Signal(dict)
 
 
+def _emit(event: str) -> None:
+    print(json.dumps({"event": event}), flush=True)  # read by orb_client
+
+
+def _tray_icon(paused: bool) -> QIcon:
+    """A tiny orb: glowing cyan when listening, grey when paused."""
+    colors = [(200, 200, 205), (130, 130, 140), (70, 70, 80)] if paused else PALETTES["listening"]
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    g = QRadialGradient(QPointF(26, 24), 34)
+    for stop, rgb in zip((0.0, 0.5, 1.0), colors):
+        g.setColorAt(stop, QColor(*rgb))
+    p.setBrush(QBrush(g))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(QRectF(4, 4, 56, 56))
+    p.end()
+    return QIcon(pm)
+
+
+class Tray:
+    """Tray icon: pause/resume listening, open the log, quit Jarvis."""
+
+    def __init__(self) -> None:
+        self.paused = False
+        self.icon = QSystemTrayIcon()
+        self.menu = QMenu()  # kept on self: Qt drops menus without an owner
+        self.toggle = self.menu.addAction("Pause listening")
+        self.toggle.triggered.connect(lambda: _emit("resume" if self.paused else "pause"))
+        log = os.environ.get("JARVIS_LOG")
+        if log:
+            self.menu.addAction("Open log").triggered.connect(lambda: os.startfile(log))
+        self.menu.addSeparator()
+        self.menu.addAction("Quit Jarvis").triggered.connect(lambda: _emit("quit"))
+        self.icon.setContextMenu(self.menu)
+        self.icon.activated.connect(self._clicked)
+
+    def _clicked(self, reason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            _emit("resume" if self.paused else "pause")
+
+    def update(self, paused: bool) -> None:
+        self.paused = paused
+        self.toggle.setText("Resume listening" if paused else "Pause listening")
+        self.icon.setIcon(_tray_icon(paused))
+        self.icon.setToolTip("Jarvis — paused (mic off)" if paused else "Jarvis — say \"Jarvis\"")
+        self.icon.show()
+
+
 class OrbWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.model = OrbModel()
+        self.tray: Tray | None = None
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
             | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus
@@ -268,6 +322,11 @@ class OrbWindow(QWidget):
     def on_message(self, msg: dict) -> None:
         if msg.get("cmd") == "quit":
             QApplication.quit()
+            return
+        if msg.get("cmd") == "tray":
+            if self.tray is None:
+                self.tray = Tray()
+            self.tray.update(bool(msg.get("paused")))
             return
         self.model.handle(msg)
         if self.model.show_target > 0 and not self.isVisible():

@@ -1,5 +1,7 @@
 """Talks to the orb window (orb.py) over its stdin, one JSON message per line.
 
+The orb process also owns the tray icon; menu clicks come back on its stdout
+as {"event": "pause"|"resume"|"quit"} lines and go to ``on_event``.
 The orb is decoration: if it can't start or dies, Jarvis keeps working.
 """
 
@@ -17,6 +19,7 @@ def _spawn_orb() -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, str(Path(__file__).with_name("orb.py"))],
         stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -24,11 +27,25 @@ def _spawn_orb() -> subprocess.Popen:
 
 
 class OrbClient:
-    def __init__(self, spawn: Callable[[], Any] = _spawn_orb) -> None:
+    def __init__(
+        self,
+        spawn: Callable[[], Any] = _spawn_orb,
+        on_event: Callable[[str], None] | None = None,
+    ) -> None:
         self._spawn = spawn
+        self.on_event = on_event
         self._proc: Any = None
         self._disabled = False
         self._lock = threading.Lock()
+
+    def _read_events(self, stdout: Any) -> None:
+        for line in stdout:
+            try:
+                event = json.loads(line).get("event")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if event and self.on_event is not None:
+                self.on_event(event)
 
     def _send(self, msg: dict) -> None:
         with self._lock:  # voice loop and reminder thread both send
@@ -37,6 +54,11 @@ class OrbClient:
             try:
                 if self._proc is None:
                     self._proc = self._spawn()
+                    stdout = getattr(self._proc, "stdout", None)
+                    if stdout is not None:
+                        threading.Thread(
+                            target=self._read_events, args=(stdout,), name="orb-events", daemon=True
+                        ).start()
                 self._proc.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
                 self._proc.stdin.flush()
             except (OSError, ValueError):  # includes BrokenPipeError
@@ -54,6 +76,10 @@ class OrbClient:
 
     def caption(self, text: str) -> None:
         self._send({"cmd": "caption", "text": text[:140]})
+
+    def tray(self, paused: bool) -> None:
+        """Show the tray icon (starting the orb process) with the current state."""
+        self._send({"cmd": "tray", "paused": paused})
 
     def hide(self) -> None:
         self._send({"cmd": "hide"})

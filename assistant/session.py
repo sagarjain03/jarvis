@@ -32,6 +32,49 @@ def is_stop_command(text: str) -> bool:
     return " ".join(words) in _STOP
 
 
+class ListenControl:
+    """Pause / resume / quit requests from the tray menu, shared with the voice loop.
+
+    While paused the microphone is closed entirely.
+    """
+
+    def __init__(self, on_change: Callable[[bool], None] = lambda paused: None) -> None:
+        self._paused = threading.Event()
+        self._quit = threading.Event()
+        self._on_change = on_change
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    @property
+    def quitting(self) -> bool:
+        return self._quit.is_set()
+
+    def should_stop(self) -> bool:
+        """True when the voice loop should stop using the microphone."""
+        return self.paused or self.quitting
+
+    def _set_paused(self, paused: bool) -> None:
+        if paused == self.paused:
+            return
+        if paused:
+            self._paused.set()
+        else:
+            self._paused.clear()
+        self._on_change(paused)
+
+    def handle(self, event: str) -> None:
+        if event == "pause":
+            self._set_paused(True)
+        elif event == "resume":
+            self._set_paused(False)
+        elif event == "toggle":
+            self._set_paused(not self.paused)
+        elif event == "quit":
+            self._quit.set()
+
+
 class Session:
     """Ends after ``idle_seconds`` without the user saying anything."""
 
